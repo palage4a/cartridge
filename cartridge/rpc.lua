@@ -38,12 +38,13 @@ local function call_local(role_name, fn_name, args)
     end
 end
 
-local function member_is_healthy(uri, instance_uuid)
+local function member_is_healthy(uri, instance_uuid, local_checksum)
     local member = membership.get_member(uri)
     return (
         (member ~= nil)
         and (member.status == 'alive' or member.status == 'suspect')
         and (member.payload.uuid == instance_uuid)
+        and (member.payload.config_checksum == local_checksum)
         and (
             member.payload.state == 'ConfiguringRoles' or
             member.payload.state == 'RolesConfigured'
@@ -79,6 +80,7 @@ local function get_candidates(role_name, opts)
         healthy_only = '?boolean'
     })
 
+    local config_checksum = confapplier.get_checksum()
     local topology_cfg = confapplier.get_readonly('topology')
     if topology_cfg == nil then
         return {}
@@ -97,8 +99,10 @@ local function get_candidates(role_name, opts)
         local replicaset = replicasets[replicaset_uuid]
 
         if roles.get_enabled_roles(replicaset.roles)[role_name]
-        and (not opts.healthy_only or member_is_healthy(server.uri, instance_uuid))
-        and (not opts.leader_only or active_leaders[replicaset_uuid] == instance_uuid)
+        and (not opts.healthy_only
+            or member_is_healthy(server.uri, instance_uuid, config_checksum))
+        and (not opts.leader_only
+            or active_leaders[replicaset_uuid] == instance_uuid)
         then
             table.insert(candidates, server.uri)
         end

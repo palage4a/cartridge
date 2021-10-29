@@ -252,6 +252,7 @@ local function apply_config(clusterwide_config)
     )
 
     vars.clusterwide_config = clusterwide_config
+    membership.set_payload('config_checksum', vars.clusterwide_config:get_checksum())
     set_state('ConfiguringRoles')
 
     local topology_cfg = clusterwide_config:get_readonly('topology')
@@ -722,6 +723,13 @@ local function get_deepcopy(section)
     return vars.clusterwide_config:get_deepcopy(section)
 end
 
+local function get_config_checksum()
+    if vars.clusterwide_config == nil then
+        return nil
+    end
+    return vars.clusterwide_config:get_checksum()
+end
+
 _G.__cartridge_confapplier_restart_replication = restart_replication
 
 return {
@@ -735,6 +743,7 @@ return {
     get_active_config = get_active_config,
     get_readonly = get_readonly,
     get_deepcopy = get_deepcopy,
+    get_checksum = get_config_checksum,
 
     set_state = set_state,
     wish_state = wish_state,
