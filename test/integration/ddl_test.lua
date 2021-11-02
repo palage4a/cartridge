@@ -58,7 +58,8 @@ g.before_all(function()
             alias = 'main',
             roles = {'vshard-router', 'vshard-storage'},
             servers = 2
-        }}
+        }},
+        swim_period = 0.05,
     })
     g.cluster:start()
 
@@ -156,11 +157,12 @@ function g.test_replicas()
     -- check_schema should work on read-only replicas
 
     for _, srv in pairs(g.cluster.servers) do
-        t.assert_equals(
-            {[srv.alias] = _check_schema(srv, _schema)},
-            {[srv.alias] = {error = box.NULL}}
-        )
-
+        t.helpers.retrying({}, function()
+            t.assert_equals(
+                {[srv.alias] = _check_schema(srv, _schema)},
+                {[srv.alias] = {error = box.NULL}}
+            )
+        end)
     end
     t.assert_equals(
         _check_schema(g.cluster:server('main-1'), '---\n...'),
@@ -267,10 +269,13 @@ function g.test_no_instances_to_check_schema()
         assert(conn:wait_connected() == false)
     ]], {s1.advertise_uri, {wait_connected = false}})
 
-    t.assert_error_msg_contains(
-        '"localhost:13301": Connection refused',
-        _check_schema, s2, _schema
-    )
+    t.helpers.retrying({}, function()
+        t.assert_error_msg_contains(
+            '"localhost:13301": Connection refused',
+            _check_schema, s2, _schema
+        )
+    end)
+
 end
 
 g.after_test('test_no_instances_to_check_schema', function()
