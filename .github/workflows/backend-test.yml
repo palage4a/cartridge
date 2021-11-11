@@ -88,6 +88,8 @@ jobs:
     runs-on: ubuntu-18.04
     steps:
       - uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
       - uses: actions/checkout@v2
       - uses: tarantool/setup-tarantool@v1
         with:
@@ -126,10 +128,11 @@ jobs:
         if: steps.cache-pytest.outputs.cache-hit != 'true'
 
       - run: tarantoolctl rocks make
-      - run: .rocks/bin/luatest -v
+      # - run: .rocks/bin/luatest -v
 
       - name: Run pytest -v
         run: |
+          which python
           . ./pytest-venv/bin/activate
           pytest -v
 
