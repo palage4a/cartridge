@@ -280,7 +280,7 @@ local function abort_2pc(ids)
     for _, id in ipairs(ids) do
         local f = fiber.find(id)
         if f then
-            f:cancel()
+            pcall(f.cancel, f)
         end
     end
     local workdir = confapplier.get_workdir()
