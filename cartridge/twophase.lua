@@ -37,6 +37,7 @@ yaml.cfg({
 vars:new('locks', {})
 vars:new('prepared_config', nil)
 vars:new('prepared', fiber.channel(1))
+vars:new('prep_fiber', nil)
 vars:new('prepared_config_release_notification', fiber.cond())
 vars:new('on_patch_triggers', {})
 
@@ -135,7 +136,7 @@ end
 -- @treturn[2] nil
 -- @treturn[2] table Error description
 local function prepare_2pc(upload_id)
-    local fb = fiber.new(function()
+    vars.prep_fiber = fiber.new(function()
         local data
         if type(upload_id) == 'table' then
             -- Preserve compatibility with older versions.
@@ -189,10 +190,12 @@ local function prepare_2pc(upload_id)
             log.warn('%s', err)
             return nil, err
         end
+
         vars.prepared_config = clusterwide_config
         vars.prepared:put(true)
     end)
-    return fb:id()
+
+    return true
 end
 
 --- Two-phase commit - commit stage.
@@ -276,13 +279,8 @@ end
 -- @function abort_2pc
 -- @local
 -- @treturn boolean true
-local function abort_2pc(ids)
-    for _, id in ipairs(ids) do
-        local f = fiber.find(id)
-        if f then
-            pcall(f.cancel, f)
-        end
-    end
+local function abort_2pc()
+    pcall(vars.prep_fiber.cancel, vars.prep_fiber)
     local workdir = confapplier.get_workdir()
     local path_prepare = fio.pathjoin(workdir, 'config.prepare')
     ClusterwideConfig.remove(path_prepare)
@@ -358,7 +356,7 @@ local function reapply(data)
 end
 
 local function confirm_prepare_2pc()
-    local signaled = vars.prepared:get(10)
+    local signaled = vars.prepared:get(2) -- NOTE: maybe here we can use `vars.prep_fiber:join`?
     local workdir = confapplier.get_workdir()
     local path_prepare = fio.pathjoin(workdir, 'config.prepare')
     if signaled and vars.prepared_config ~= nil
@@ -493,7 +491,6 @@ local function twophase_commit(opts)
         for _, uri in ipairs(opts.uri_list) do
             if retmap[uri] then
                 log.warn('Prepared for %s at %s', activity_name, uri)
-                table.insert(prepare_fibers, retmap[uri])
             end
         end
 
@@ -520,7 +517,7 @@ local function twophase_commit(opts)
         local retmap, errmap = pool.map_call(opts.fn_confirm_prepare, nil, {
             uri_list = opts.uri_list,
             timeout = vars.options.validate_config_timeout,
-        })
+       })
 
         for _, uri in ipairs(opts.uri_list) do
             if retmap[uri] then
@@ -542,7 +539,7 @@ local function twophase_commit(opts)
         else
             goto apply
         end
-
+   end
 ::apply::
     do
         log.warn('(2PC) %s commit phase...', activity_name)
@@ -572,7 +569,7 @@ local function twophase_commit(opts)
     do
         log.warn('(2PC) %s abort phase...', activity_name)
 
-        local retmap, errmap = pool.map_call(opts.fn_abort, { prepare_fibers }, {
+        local retmap, errmap = pool.map_call(opts.fn_abort, nil, {
             uri_list = opts.uri_list,
             timeout = vars.options.netbox_call_timeout,
         })
@@ -692,6 +689,7 @@ local function _clusterwide(patch)
     local _, err = twophase_commit({
         uri_list = uri_list,
         fn_prepare = '_G.__cartridge_clusterwide_config_prepare_2pc',
+        fn_confirm_prepare = '_G.__cartridge_clusterwide_confirm_prepare_2pc',
         fn_commit = '_G.__cartridge_clusterwide_config_commit_2pc',
         fn_abort = '_G.__cartridge_clusterwide_config_abort_2pc',
         upload_data = clusterwide_config_new:get_plaintext(),
