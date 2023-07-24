@@ -186,7 +186,7 @@ local function prepare_2pc(upload_id)
             err = Prepare2pcError:new('Two-phase commit is locked')
         end
 
-        if not ok then
+        if not ok or err then
             log.warn('%s', err)
             return nil, err
         end
@@ -194,6 +194,7 @@ local function prepare_2pc(upload_id)
         vars.prepared_config = clusterwide_config
         vars.prepared:put(true)
     end)
+    vars.prep_fiber:set_joinable(true)
 
     return true
 end
@@ -356,14 +357,16 @@ local function reapply(data)
 end
 
 local function confirm_prepare_2pc()
-    local signaled = vars.prepared:get(2) -- NOTE: maybe here we can use `vars.prep_fiber:join`?
+    local signaled = vars.prepared:get(vars.options.validate_config_timeout) -- NOTE: maybe here we can use `vars.prep_fiber:join`?
+
     local workdir = confapplier.get_workdir()
     local path_prepare = fio.pathjoin(workdir, 'config.prepare')
-    if signaled and vars.prepared_config ~= nil
+    if vars.prepared_config ~= nil
         and fio.path.exists(path_prepare) then
         return true
     end
-    return nil, "CW isn't' prepared"
+
+    return res, err
 end
 
 --- Execute the two-phase commit algorithm.
@@ -432,7 +435,7 @@ local function twophase_commit(opts)
         uri_list = 'table',
         upload_data = '?',
         fn_prepare = 'string',
-        fn_confirm_prepare = 'string',
+        fn_confirm_prepare = '?string',
         fn_abort = 'string',
         fn_commit = 'string',
         activity_name = '?string'
@@ -516,12 +519,12 @@ local function twophase_commit(opts)
     do
         local retmap, errmap = pool.map_call(opts.fn_confirm_prepare, nil, {
             uri_list = opts.uri_list,
-            timeout = vars.options.validate_config_timeout,
+            timeout = vars.options.validate_config_timeout * 2,
        })
 
         for _, uri in ipairs(opts.uri_list) do
             if retmap[uri] then
-                log.warn('Confirmed for %s at %s', activity_name, uri)
+                -- log.warn('Confirmed for %s at %s', activity_name, uri)
             end
         end
         for _, uri in ipairs(opts.uri_list) do
