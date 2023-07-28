@@ -262,6 +262,29 @@ function g.test_abort_fails()
     )
 end
 
+g.before_test('test_timeouts', function()
+    -- NOTE: `:eval` is used here since `:exec` throws error
+    -- "assign to undeclared variable '__default_2pc_timeouts'"
+    g.s1:eval([[
+        local twophase = require('cartridge.twophase')
+        local t1 = twophase.get_netbox_call_timeout()
+        local t2 = twophase.get_upload_config_timeout()
+        local t3 = twophase.get_validate_config_timeout()
+        local t4 = twophase.get_apply_config_timeout()
+        _G.__default_2pc_timeouts = function()
+            twophase.set_netbox_call_timeout(t1)
+            twophase.set_upload_config_timeout(t2)
+            twophase.set_validate_config_timeout(t3)
+            twophase.set_apply_config_timeout(t4)
+        end]])
+end)
+g.after_test('test_timeouts', function()
+    g.s1:exec(function()
+        _G.__default_2pc_timeouts()
+        _G.__default_2pc_timeouts = nil
+    end)
+end)
+
 function g.test_timeouts()
     g.s1:exec(function()
         local t = require('luatest')
