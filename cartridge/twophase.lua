@@ -38,17 +38,20 @@ vars:new('locks', {})
 vars:new('prepared_config', nil)
 vars:new('prepared_config_release_notification', fiber.cond())
 vars:new('on_patch_triggers', {})
+vars:new('preparation_fiber', nil)
 
 vars:new('options', {
     netbox_call_timeout = 1,
     upload_config_timeout = 30,
     validate_config_timeout = 10,
     apply_config_timeout = 10,
+    abort_method = 'default',
 })
 
 local function release_config_lock()
     local prepared_config = vars.prepared_config
     vars.prepared_config = nil
+    vars.preparation_fiber = nil
     vars.prepared_config_release_notification:broadcast()
     return prepared_config
 end
@@ -87,6 +90,20 @@ end
 
 local function get_apply_config_timeout()
     return vars.options.apply_config_timeout
+end
+
+local function set_abort_method(val)
+    checks('string')
+    if val ~= 'default' and
+        val ~= 'join' and
+        val ~= 'cancel' then
+        error("Wrong value for the abort_method")
+    end
+    vars.options.abort_method = val
+end
+
+local function get_abort_method()
+    return vars.options.abort_method
 end
 
 --- Wait until config won't released.
@@ -133,7 +150,8 @@ end
 -- @treturn[1] boolean true
 -- @treturn[2] nil
 -- @treturn[2] table Error description
-local function prepare_2pc(upload_id)
+local function prepare_2pc(upload_id, cancelable)
+    vars.preparation_fiber = fiber.self()
     local data
     if type(upload_id) == 'table' then
         -- Preserve compatibility with older versions.
@@ -171,14 +189,16 @@ local function prepare_2pc(upload_id)
 
     local workdir = confapplier.get_workdir()
     local path_prepare = fio.pathjoin(workdir, 'config.prepare')
-
     if vars.prepared_config ~= nil then
         local err = Prepare2pcError:new('Two-phase commit is locked')
         log.warn('%s', err)
         return nil, err
     end
 
-    local ok, err = ClusterwideConfig.save(clusterwide_config, path_prepare)
+    local ok, err = ClusterwideConfig.save(clusterwide_config, path_prepare, {cancelable = cancelable})
+    if cancelable then
+        fiber.testcancel()
+    end
     if not ok and fio.path.exists(path_prepare) then
         err = Prepare2pcError:new('Two-phase commit is locked')
     end
@@ -267,13 +287,41 @@ local function commit_2pc()
     end
 end
 
+local function handle_preparation_fiber(abort_method)
+    if abort_method == 'default' then
+        return
+    end
+    local f = vars.preparation_fiber
+    if not f then
+        log.warn("Preparation fiber was not created")
+        return
+    end
+    if f:status() == 'dead' then
+        log.warn("Preparation fiber already dead")
+        return
+    end
+    f:set_joinable(true)
+    local ok, err
+    ok, err = pcall(f.cancel, f)
+    if not ok then
+        log.warn("Cancel the preparation fiber error: " .. err)
+        return
+    end
+    ok, err = pcall(f.join, f)
+    if not ok then
+        log.warn("Join the preparation fiber error: " .. err)
+        return
+    end
+end
+
 --- Two-phase commit - abort stage.
 --
 -- Release the lock for further commit attempts.
 -- @function abort_2pc
 -- @local
 -- @treturn boolean true
-local function abort_2pc()
+local function abort_2pc(abort_method)
+    handle_preparation_fiber(abort_method)
     local workdir = confapplier.get_workdir()
     local path_prepare = fio.pathjoin(workdir, 'config.prepare')
     ClusterwideConfig.remove(path_prepare)
@@ -463,8 +511,11 @@ local function twophase_commit(opts)
         end
 
         log.warn('(2PC) %s prepare phase...', activity_name)
-
-        local retmap, errmap = pool.map_call(opts.fn_prepare, {upload_id}, {
+        local cancelable = false
+        if vars.options.abort_method == 'cancel' then
+            cancelable = true
+        end
+        local retmap, errmap = pool.map_call(opts.fn_prepare, {upload_id, cancelable}, {
             uri_list = opts.uri_list,
             timeout = vars.options.validate_config_timeout,
         })
@@ -521,8 +572,11 @@ local function twophase_commit(opts)
 ::abort::
     do
         log.warn('(2PC) %s abort phase...', activity_name)
+        if vars.options.abort_method ~= 'default' then
+            abortion_list = opts.uri_list
+        end
 
-        local retmap, errmap = pool.map_call(opts.fn_abort, nil,{
+        local retmap, errmap = pool.map_call(opts.fn_abort, {vars.options.abort_method},{
             uri_list = abortion_list,
             timeout = vars.options.netbox_call_timeout,
         })
@@ -896,6 +950,8 @@ return {
     get_validate_config_timeout = get_validate_config_timeout,
     set_apply_config_timeout = set_apply_config_timeout,
     get_apply_config_timeout = get_apply_config_timeout,
+    set_abort_method = set_abort_method,
+    get_abort_method = get_abort_method,
     wait_config_release = wait_config_release,
     -- Cartridge supports backward compatibility but not the forward
     -- one. Thus operations that modify clusterwide config should be

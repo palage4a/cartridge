@@ -29,6 +29,62 @@ local function call_twophase(server, arg)
     ]], {arg})
 end
 
+local function rewind_2pc_options(server)
+    server:exec(function()
+        _G.__rewind_2pc_options()
+    end)
+end
+
+local function force_reapply()
+    g.s1:exec(function()
+        local topology = require('cartridge.confapplier').get_readonly('topology')
+        local uuids = require('fun').iter(topology.servers):totable()
+        require('cartridge.twophase').force_reapply(uuids)
+    end)
+end
+
+local function start_high_load(server, fibers, sleep)
+    server:eval([[
+        local fiber = require('fiber')
+        local log = require('log')
+        local ffi = require('ffi')
+        local fibers_count, timeout = ...
+        ffi.cdef("int poll(struct pollfd *fds, unsigned long nfds, int timeout);")
+        local fibers = {}
+        for i = 1, fibers_count do
+            local fb = fiber.create(function()
+                while true do
+                    ffi.C.poll(box.NULL, 0, timeout) -- blocks fiber for the specified amount of ms
+                    fiber.yield()
+                end
+            end)
+            table.insert(fibers, fb)
+        end
+        _G.__cancel_fibers  = function()
+           for i, f in ipairs(fibers) do
+               f:cancel()
+           end
+        end]], {fibers, sleep})
+end
+
+local REWIND_2PC_OPTIONS_FUNC_BODY = [[
+        local twophase = require('cartridge.twophase')
+        local t1 = twophase.get_netbox_call_timeout()
+        local t2 = twophase.get_upload_config_timeout()
+        local t3 = twophase.get_validate_config_timeout()
+        local t4 = twophase.get_apply_config_timeout()
+        local v1 = twophase.get_abort_method()
+        _G.__rewind_2pc_options = function()
+            twophase.set_netbox_call_timeout(t1)
+            twophase.set_upload_config_timeout(t2)
+            twophase.set_validate_config_timeout(t3)
+            twophase.set_apply_config_timeout(t4)
+            twophase.set_abort_method(v1)
+        end]]
+
+local function stop_high_load(server)
+    server:exec(function() pcall(_G.__cancel_fibers) end)
+end
 
 g.before_all(function()
     g.cluster = helpers.Cluster:new({
@@ -51,6 +107,9 @@ g.before_all(function()
     g.simple_stage_func_bad = [[function()
         return nil, require('errors').new('Err', 'Error occured')
     end]]
+
+    g.s1:eval(REWIND_2PC_OPTIONS_FUNC_BODY)
+    g.s2:eval(REWIND_2PC_OPTIONS_FUNC_BODY)
 end)
 
 g.after_all(function()
@@ -59,6 +118,9 @@ g.after_all(function()
 end)
 
 g.before_each(function()
+    rewind_2pc_options(g.s1)
+    rewind_2pc_options(g.s2)
+    force_reapply()
     init_remote_funcs(g.cluster.servers, g.two_phase_funcs, g.simple_stage_func_good)
     cleanup_log_data()
 end)
@@ -262,29 +324,6 @@ function g.test_abort_fails()
     )
 end
 
-g.before_test('test_timeouts', function()
-    -- NOTE: `:eval` is used here since `:exec` throws error
-    -- "assign to undeclared variable '__default_2pc_timeouts'"
-    g.s1:eval([[
-        local twophase = require('cartridge.twophase')
-        local t1 = twophase.get_netbox_call_timeout()
-        local t2 = twophase.get_upload_config_timeout()
-        local t3 = twophase.get_validate_config_timeout()
-        local t4 = twophase.get_apply_config_timeout()
-        _G.__default_2pc_timeouts = function()
-            twophase.set_netbox_call_timeout(t1)
-            twophase.set_upload_config_timeout(t2)
-            twophase.set_validate_config_timeout(t3)
-            twophase.set_apply_config_timeout(t4)
-        end]])
-end)
-g.after_test('test_timeouts', function()
-    g.s1:exec(function()
-        _G.__default_2pc_timeouts()
-        _G.__default_2pc_timeouts = nil
-    end)
-end)
-
 function g.test_timeouts()
     g.s1:exec(function()
         local t = require('luatest')
@@ -302,4 +341,148 @@ function g.test_timeouts()
         twophase.set_apply_config_timeout(111)
         t.assert_equals(twophase.get_apply_config_timeout(), 111)
     end)
+end
+
+-- immitate the 'preparing instance' error
+g.before_test('test_default_abort_method', function()
+    g.s1:exec(function()
+        require("cartridge.twophase").set_validate_config_timeout(0.001)
+    end)
+end)
+
+-- by default, we must to keep lock after the commit abortion
+function g.test_default_abort_method()
+    g.s1:exec(function()
+        require('cartridge.twophase').patch_clusterwide({})
+    end)
+
+    g.s1:exec(function()
+        local t = require('luatest')
+        local _, err = require('cartridge.twophase').patch_clusterwide({})
+        t.assert(err)
+        t.assert_str_icontains(err.err, 'Two-phase commit is locked')
+    end)
+end
+
+g.before_test('test_join_abort_method', function()
+    g.s1:eval(function()
+        require('cartridge.twophase').set_validate_config_timeout(0.001)
+        require('cartridge.twophase').set_abort_method('join')
+    end)
+end)
+
+
+-- Check we don't lock a clusterwide config updates
+-- after exceeding of `validate_timeout_config` timeout
+-- see https://github.com/tarantool/cartridge/issues/2119
+function g.test_join_abort_method()
+    g.s1:exec(function()
+        require('cartridge.twophase').patch_clusterwide({})
+    end)
+
+    rewind_2pc_options(g.s1)
+
+    g.s1:exec(function()
+        local t = require('luatest')
+        local _, err = require('cartridge.twophase').patch_clusterwide({})
+        t.assert_not(err)
+    end)
+end
+
+g.before_test('test_cancel_abort_method', function()
+    g.s1:exec(function()
+        require('cartridge.twophase').set_validate_config_timeout(0.001)
+        require('cartridge.twophase').set_abort_method('cancel')
+    end)
+end)
+
+-- Check we don't lock a clusterwide config updates
+-- after exceeding of `validate_timeout_config` timeout
+-- see https://github.com/tarantool/cartridge/issues/2119
+function g.test_cancel_abort_method()
+    g.s1:exec(function()
+        local t = require('luatest')
+        local _, err = require('cartridge.twophase').patch_clusterwide({})
+        t.assert(err)
+    end)
+
+    rewind_2pc_options(g.s1)
+
+    g.s1:exec(function()
+        local t = require('luatest')
+        local _, err = require('cartridge.twophase').patch_clusterwide({})
+        t.assert_not(err)
+    end)
+end
+
+g.before_test('test_highloaded_abort', function()
+    -- decrease timeout for speeding up test
+    g.s1:exec(function()
+        local twophase = require('cartridge.twophase')
+        twophase.set_validate_config_timeout(0.1)
+    end)
+
+    -- wrap twophase commit phases:
+    -- - preparation phase - to get the fiber's csw
+    -- - abort phase - to calculate the duration
+    g.s2:eval([[
+        _G.__abort_dur = 0
+        _G.__prep_fiber_csw = 0
+        local super = _G.__cartridge_clusterwide_config_abort_2pc
+        _G.__cartridge_clusterwide_config_abort_2pc = function(...)
+            local clock = require('clock')
+            local _start = clock.monotonic64() / 1e6
+            local ok , res = super(...)
+            local _end = clock.monotonic64() / 1e6
+            _G.__abort_dur = _end - _start
+            return ok, res
+        end
+        local super_prep = _G.__cartridge_clusterwide_config_prepare_2pc
+        _G.__cartridge_clusterwide_config_prepare_2pc = function(...)
+            local f = require('fiber').self()
+            local yields = require('fiber').info()[f:id()].csw
+            local ok , res = super_prep(...)
+            _G.__prep_fiber_csw = require('fiber').info()[f:id()].csw - yields
+            return ok, res
+        end]])
+
+    start_high_load(g.s2, 10, 1)
+end)
+
+g.after_test('test_highloaded_abort', function()
+    stop_high_load(g.s2)
+end)
+
+function g.test_highloaded_abort()
+    -- run the twophase apply without
+    -- the interaption of the preparation fiber
+    g.s1:exec(function()
+        local t = require('luatest')
+        require('cartridge.twophase').set_abort_method("join")
+        local _, err = require('cartridge.twophase').patch_clusterwide({})
+        t.assert(err)
+    end)
+    local join_abort_duration, join_prep_csw = g.s2:exec(function()
+        return tonumber(_G.__abort_dur), _G.__prep_fiber_csw -- luacheck:ignore
+    end)
+
+    -- run the twophase apply with the interaption
+    -- of the preparation fiber by `fiber.testcancel()`
+    g.s1:exec(function()
+        local t = require('luatest')
+        require('cartridge.twophase').set_abort_method("cancel")
+        local _, err = require('cartridge.twophase').patch_clusterwide({})
+        t.assert(err)
+    end)
+    local cancel_abort_duration, cancel_prep_csw = g.s2:exec(function()
+        return tonumber(_G.__abort_dur), _G.__prep_fiber_csw -- luacheck:ignore
+    end)
+    require('log').info('debug')
+    require('log').info('debug')
+    require('log').info(join_prep_csw)
+    require('log').info('debug')
+    require('log').info('debug')
+
+    t.assert_lt(cancel_abort_duration, join_abort_duration)
+    t.assert_lt(cancel_prep_csw, join_prep_csw)
 end

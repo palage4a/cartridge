@@ -59,6 +59,7 @@ local checks = require('checks')
 local digest = require('digest')
 local errno = require('errno')
 local errors = require('errors')
+local fiber = require('fiber')
 
 local utils = require('cartridge.utils')
 
@@ -482,11 +483,17 @@ end
 -- @treturn[1] boolean true
 -- @treturn[2] nil
 -- @treturn[2] table Error description
-local function save(clusterwide_config, path)
-    checks('ClusterwideConfig', 'string')
+local function save(clusterwide_config, path, opts)
+    checks('ClusterwideConfig', 'string', {
+        cancelable = '?boolean'
+    })
+    opts = opts or {}
     local random_path = utils.randomize_path(path)
 
     local ok, err = utils.mktree(random_path)
+    if opts.cancelable then
+        fiber.testcancel()
+    end
     if not ok then
         return nil, err
     end
@@ -496,6 +503,9 @@ local function save(clusterwide_config, path)
         local dirname = fio.dirname(abspath)
 
         ok, err = utils.mktree(dirname)
+        if opts.cancelable then
+            fiber.testcancel()
+        end
         if not ok then
             goto rollback
         end
@@ -504,12 +514,18 @@ local function save(clusterwide_config, path)
             abspath, content,
             {'O_CREAT', 'O_EXCL', 'O_WRONLY', 'O_SYNC'}
         )
+        if opts.cancelable then
+            fiber.testcancel()
+        end
         if not ok then
             goto rollback
         end
     end
 
     ok = fio.rename(random_path, path)
+    if opts.cancelable then
+        fiber.testcancel()
+    end
     if not ok then
         err = SaveConfigError:new(
             '%s: %s',
@@ -522,6 +538,9 @@ local function save(clusterwide_config, path)
 
 ::rollback::
     local ok, _err = fio.rmtree(random_path)
+    if opts.cancelable then
+        fiber.testcancel()
+    end
     if not ok then
         log.warn(
             "Error removing %s: %s",
