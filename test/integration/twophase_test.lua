@@ -46,7 +46,7 @@ g.before_all(function()
     g.s1 = g.cluster:server('main-1')
     g.s2 = g.cluster:server('main-2')
 
-    g.two_phase_funcs = {'_G.__prepare', '_G.__abort', '_G.__commit'}
+    g.two_phase_funcs = {'_G.__prepare', '_G.__abort', '_G.__commit', '_G.__confirm_prepare'}
     g.simple_stage_func_good = [[function(data) return true end]]
     g.simple_stage_func_bad = [[function()
         return nil, require('errors').new('Err', 'Error occured')
@@ -139,6 +139,7 @@ function g.test_success()
         fn_prepare = '_G.__prepare',
         fn_commit = '_G.__commit',
         fn_abort = '_G.__abort',
+        fn_confirm_prepare = '_G.__confirm_prepare',
         upload_data = {'xyz'},
     })
     t.assert_equals({ok, err}, {true, nil})
@@ -175,6 +176,7 @@ function g.test_upload_skipped()
         fn_prepare = '_G.__prepare',
         fn_commit = '_G.__commit',
         fn_abort = '_G.__abort',
+        fn_confirm_prepare = '_G.__confirm_prepare',
     })
     t.assert_equals({ok, err}, {true, nil})
     t.assert_equals(g.s1:eval('return _G.__log_error'), {})
@@ -192,6 +194,7 @@ function g.test_prepare_fails()
     local twophase_args = {
         fn_prepare = '_G.__prepare',
         fn_abort = '_G.__abort',
+        fn_confirm_prepare = '_G.__confirm_prepare',
         fn_commit = '_G.__commit',
         uri_list = {'localhost:13301', 'localhost:13302'},
         activity_name = 'simple_twophase'
@@ -217,6 +220,7 @@ function g.test_commit_fails()
     local twophase_args = {
         fn_prepare = '_G.__prepare',
         fn_abort = '_G.__abort',
+        fn_confirm_prepare = '_G.__confirm_prepare',
         fn_commit = '_G.__commit',
         uri_list = {'localhost:13301', 'localhost:13302'},
         activity_name = 'simple_twophase'
@@ -241,6 +245,7 @@ function g.test_abort_fails()
     local twophase_args = {
         fn_prepare = '_G.__prepare',
         fn_abort = '_G.__abort',
+        fn_confirm_prepare = '_G.__confirm_prepare',
         fn_commit = '_G.__commit',
         uri_list = {'localhost:13301', 'localhost:13302'},
         activity_name = 'simple_twophase'
@@ -278,5 +283,17 @@ function g.test_timeouts()
 
         twophase.set_apply_config_timeout(111)
         t.assert_equals(twophase.get_apply_config_timeout(), 111)
+    end)
+end
+
+function g.test_2pc_is_locked()
+    g.s1:exec(function()
+        local t = require('luatest')
+        local twophase = require('cartridge.twophase')
+        twophase.set_validate_config_timeout(0.8)
+        local _, err = twophase.patch_clusterwide({})
+        twophase.set_validate_config_timeout(10) -- default
+        _, err = twophase.patch_clusterwide({})
+        t.assert_not(err)
     end)
 end

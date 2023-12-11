@@ -36,6 +36,8 @@ yaml.cfg({
 
 vars:new('locks', {})
 vars:new('prepared_config', nil)
+vars:new('prepared', fiber.channel(1))
+vars:new('prep_fiber', nil)
 vars:new('prepared_config_release_notification', fiber.cond())
 vars:new('on_patch_triggers', {})
 
@@ -134,61 +136,66 @@ end
 -- @treturn[2] nil
 -- @treturn[2] table Error description
 local function prepare_2pc(upload_id)
-    local data
-    if type(upload_id) == 'table' then
-        -- Preserve compatibility with older versions.
-        -- Until cartridge 2.4.0-43 it was `prepare_2pc(data)`.
-        data = upload_id
-    else
-        data = upload.inbox[upload_id]
-        upload.inbox[upload_id] = nil
-        if not data then
-            return nil, Prepare2pcError:new(
-                'Upload not found, see earlier logs for the details'
-            )
+    vars.prep_fiber = fiber.new(function()
+        local data
+        if type(upload_id) == 'table' then
+            -- Preserve compatibility with older versions.
+            -- Until cartridge 2.4.0-43 it was `prepare_2pc(data)`.
+            data = upload_id
+        else
+            data = upload.inbox[upload_id]
+            upload.inbox[upload_id] = nil
+            if not data then
+                return nil, Prepare2pcError:new(
+                    'Upload not found, see earlier logs for the details'
+                )
+            end
         end
-    end
 
-    local state = confapplier.get_state()
-    if state ~= 'Unconfigured'
-    and state ~= 'RolesConfigured'
-    and state ~= 'OperationError'
-    then
-        local err = Prepare2pcError:new(
-            "Instance state is %s, can't apply config in this state",
-            state
-        )
-        log.warn('%s', err)
-        return nil, err
-    end
+        local state = confapplier.get_state()
+        if state ~= 'Unconfigured'
+            and state ~= 'RolesConfigured'
+            and state ~= 'OperationError'
+        then
+            local err = Prepare2pcError:new(
+                "Instance state is %s, can't apply config in this state",
+                state
+            )
+            log.warn('%s', err)
+            return nil, err
+        end
 
-    local clusterwide_config = ClusterwideConfig.new(data):lock()
-    local ok, err = confapplier.validate_config(clusterwide_config)
-    if not ok then
-        log.warn('%s', err)
-        return nil, err
-    end
+        local clusterwide_config = ClusterwideConfig.new(data):lock()
+        local ok, err = confapplier.validate_config(clusterwide_config)
+        if not ok then
+            log.warn('%s', err)
+            return nil, err
+        end
 
-    local workdir = confapplier.get_workdir()
-    local path_prepare = fio.pathjoin(workdir, 'config.prepare')
+        local workdir = confapplier.get_workdir()
+        local path_prepare = fio.pathjoin(workdir, 'config.prepare')
 
-    if vars.prepared_config ~= nil then
-        local err = Prepare2pcError:new('Two-phase commit is locked')
-        log.warn('%s', err)
-        return nil, err
-    end
+        if vars.prepared_config ~= nil then
+            local err = Prepare2pcError:new('Two-phase commit is locked')
+            log.warn('%s', err)
+            return nil, err
+        end
 
-    local ok, err = ClusterwideConfig.save(clusterwide_config, path_prepare)
-    if not ok and fio.path.exists(path_prepare) then
-        err = Prepare2pcError:new('Two-phase commit is locked')
-    end
+        local ok, err = ClusterwideConfig.save(clusterwide_config, path_prepare)
+        if not ok and fio.path.exists(path_prepare) then
+            err = Prepare2pcError:new('Two-phase commit is locked')
+        end
 
-    if not ok then
-        log.warn('%s', err)
-        return nil, err
-    end
+        if not ok or err then
+            log.warn('%s', err)
+            return nil, err
+        end
 
-    vars.prepared_config = clusterwide_config
+        vars.prepared_config = clusterwide_config
+        vars.prepared:put(true)
+    end)
+    vars.prep_fiber:set_joinable(true)
+
     return true
 end
 
@@ -274,6 +281,7 @@ end
 -- @local
 -- @treturn boolean true
 local function abort_2pc()
+    pcall(vars.prep_fiber.cancel, vars.prep_fiber)
     local workdir = confapplier.get_workdir()
     local path_prepare = fio.pathjoin(workdir, 'config.prepare')
     ClusterwideConfig.remove(path_prepare)
@@ -348,6 +356,19 @@ local function reapply(data)
     end
 end
 
+local function confirm_prepare_2pc()
+    local signaled = vars.prepared:get(vars.options.validate_config_timeout) -- NOTE: maybe here we can use `vars.prep_fiber:join`?
+
+    local workdir = confapplier.get_workdir()
+    local path_prepare = fio.pathjoin(workdir, 'config.prepare')
+    if vars.prepared_config ~= nil
+        and fio.path.exists(path_prepare) then
+        return true
+    end
+
+    return res, err
+end
+
 --- Execute the two-phase commit algorithm.
 --
 -- * (*upload*) If `opts.upload_data` isn't `nil`, spread it across
@@ -414,6 +435,7 @@ local function twophase_commit(opts)
         uri_list = 'table',
         upload_data = '?',
         fn_prepare = 'string',
+        fn_confirm_prepare = '?string',
         fn_abort = 'string',
         fn_commit = 'string',
         activity_name = '?string'
@@ -440,7 +462,7 @@ local function twophase_commit(opts)
     end
 
     local _2pc_error
-    local abortion_list = {}
+    local prepare_fibers = {}
     local activity_name = opts.activity_name or 'twophase_commit'
 
     goto prepare
@@ -466,15 +488,15 @@ local function twophase_commit(opts)
 
         local retmap, errmap = pool.map_call(opts.fn_prepare, {upload_id}, {
             uri_list = opts.uri_list,
-            timeout = vars.options.validate_config_timeout,
+            timeout = vars.options.netbox_call_timeout,
         })
 
         for _, uri in ipairs(opts.uri_list) do
             if retmap[uri] then
                 log.warn('Prepared for %s at %s', activity_name, uri)
-                table.insert(abortion_list, uri)
             end
         end
+
         for _, uri in ipairs(opts.uri_list) do
             if retmap[uri] == nil then
                 local err = errmap and errmap[uri]
@@ -489,10 +511,38 @@ local function twophase_commit(opts)
         if _2pc_error ~= nil then
             goto abort
         else
-            goto apply
+            goto confirm
         end
     end
 
+::confirm::
+    do
+        local retmap, errmap = pool.map_call(opts.fn_confirm_prepare, nil, {
+            uri_list = opts.uri_list,
+            timeout = vars.options.validate_config_timeout * 2,
+       })
+
+        for _, uri in ipairs(opts.uri_list) do
+            if retmap[uri] then
+                -- log.warn('Confirmed for %s at %s', activity_name, uri)
+            end
+        end
+        for _, uri in ipairs(opts.uri_list) do
+            if retmap[uri] == nil then
+                local err = errmap and errmap[uri]
+                if err == nil then
+                    err = Prepare2pcError:new('Unknown error at %s', uri)
+                end
+                log.error('Error confirming for %s at %s:\n%s', activity_name, uri, err)
+                _2pc_error = err
+            end
+        end
+        if _2pc_error ~= nil then
+            goto abort
+        else
+            goto apply
+        end
+   end
 ::apply::
     do
         log.warn('(2PC) %s commit phase...', activity_name)
@@ -522,12 +572,12 @@ local function twophase_commit(opts)
     do
         log.warn('(2PC) %s abort phase...', activity_name)
 
-        local retmap, errmap = pool.map_call(opts.fn_abort, nil,{
-            uri_list = abortion_list,
+        local retmap, errmap = pool.map_call(opts.fn_abort, nil, {
+            uri_list = opts.uri_list,
             timeout = vars.options.netbox_call_timeout,
         })
 
-        for _, uri in ipairs(abortion_list) do
+        for _, uri in ipairs(opts.uri_list) do
             if retmap[uri] then
                 log.warn('Aborted %s at %s', activity_name, uri)
             else
@@ -642,6 +692,7 @@ local function _clusterwide(patch)
     local _, err = twophase_commit({
         uri_list = uri_list,
         fn_prepare = '_G.__cartridge_clusterwide_config_prepare_2pc',
+        fn_confirm_prepare = '_G.__cartridge_clusterwide_confirm_prepare_2pc',
         fn_commit = '_G.__cartridge_clusterwide_config_commit_2pc',
         fn_abort = '_G.__cartridge_clusterwide_config_abort_2pc',
         upload_data = clusterwide_config_new:get_plaintext(),
@@ -859,6 +910,7 @@ local function on_patch(trigger_new, trigger_old)
 end
 
 _G.__cartridge_clusterwide_config_prepare_2pc = function(...) return errors.pcall('E', prepare_2pc, ...) end
+_G.__cartridge_clusterwide_confirm_prepare_2pc = function(...) return errors.pcall('E', confirm_prepare_2pc, ...) end
 _G.__cartridge_clusterwide_config_commit_2pc = function(...) return errors.pcall('E', commit_2pc, ...) end
 _G.__cartridge_clusterwide_config_abort_2pc = function(...) return errors.pcall('E', abort_2pc, ...) end
 _G.__cartridge_clusterwide_config_reapply = function(...) return errors.pcall('E', reapply, ...) end
